@@ -1,62 +1,90 @@
--- برای جلوگیری از خطاهای کلید خارجی، جداول را به ترتیب وابستگی معکوس حذف می‌کنیم
-DROP TABLE IF EXISTS trade_signals;
-DROP TABLE IF EXISTS api_accounts;
-DROP TABLE IF EXISTS bot_users;
+# db_utils.py
+import mysql.connector
+from mysql.connector import pooling
+import logging
+import config  # ما از config برای خواندن تنظیمات دیتابیس (که از .env آمده) استفاده می‌کنیم
 
--- ۱. جدول کاربران تلگرام
-CREATE TABLE bot_users (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    telegram_user_id BIGINT NOT NULL UNIQUE,
-    username VARCHAR(100) NOT NULL UNIQUE,
-    hashed_password VARCHAR(255) NOT NULL,
-    is_admin BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+# تنظیمات لاگ‌گیری
+logging.basicConfig(level=config.BOT["LOG_LEVEL"], format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
--- ۲. جدول اکانت‌های صرافی (متصل به کاربران)
-CREATE TABLE api_accounts (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    owner_user_id INT NOT NULL,              -- این به bot_users.id اشاره دارد
-    account_name VARCHAR(100) NOT NULL,
-    api_key TEXT NOT NULL,                   -- کلید API رمزنگاری شده
-    trade_amount_tmn DECIMAL(15, 2) NOT NULL DEFAULT 500000.00,
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    FOREIGN KEY (owner_user_id) REFERENCES bot_users(id) ON DELETE CASCADE,
-    -- یک کاربر نمی‌تواند دو اکانت هم‌نام داشته باشد
-    UNIQUE KEY uk_owner_account_name (owner_user_id, account_name) 
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+# --- ۱. ایجاد استخر کانکشن (Connection Pool) ---
+# این استخر به صورت گلوبال در این ماژول ساخته می‌شود و فقط یک بار اجرا می‌شود
+try:
+    if not config.DATABASE.get("user") or not config.DATABASE.get("password"):
+        logging.critical("اطلاعات کاربر یا پسورد دیتابیس در .env یافت نشد.")
+        db_pool = None
+    else:
+        db_pool = mysql.connector.pooling.MySQLConnectionPool(
+            pool_name="tradebot_pool",
+            pool_size=5,  # تعداد کانکشن‌هایی که باز نگه داشته می‌شوند
+            pool_reset_session=True,
+            **config.DATABASE
+        )
+        logging.info("استخر کانکشن دیتابیس (Connection Pool) با موفقیت ایجاد شد.")
+except mysql.connector.Error as e:
+    logging.critical(f"خطای بحرانی در ایجاد Connection Pool: {e}")
+    db_pool = None
 
--- ۳. جدول سیگنال‌های ترید (با ساختار کامل و متصل به اکانت‌ها)
-CREATE TABLE trade_signals (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    asset_name VARCHAR(20) NOT NULL,
-    pair VARCHAR(50),
-    entry_price DECIMAL(20, 10),
-    exit_price DECIMAL(20, 10),
-    strategy_name VARCHAR(100),
+def get_db_connection():
+    """یک کانکشن از استخر دریافت می‌کند."""
+    if not db_pool:
+        logging.error("Connection Pool در دسترس نیست. آیا دیتابیس روشن است؟")
+        return None
+    try:
+        # get_connection() به صورت خودکار یک کانکشن آزاد از استخر برمی‌دارد
+        return db_pool.get_connection()
+    except mysql.connector.Error as e:
+        logging.error(f"خطا در دریافت کانکشن از استخر: {e}")
+        return None
+
+def query_db(query, params=None, fetch=None):
+    """
+    تابع عمومی اجرای کوئری، اکنون با استفاده از Connection Pool.
     
-    -- === ستون کلیدی جدید ===
-    account_id INT NOT NULL, 
+    :param query: رشته کوئری SQL
+    :param params: پارامترهای جایگزین در کوئری (برای جلوگیری از SQL Injection)
+    :param fetch: 'one' (برای یک ردیف)، 'all' (برای همه ردیف‌ها)، None (برای INSERT/UPDATE/DELETE)
+    """
+    connection = get_db_connection()
+    if not connection:
+        return None
     
-    status VARCHAR(50) NOT NULL DEFAULT 'NEW_SIGNAL',
-    notes TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    cursor = None
+    try:
+        # dictionary=True باعث می‌شود نتایج به صورت دیکشنری (dict) برگردند
+        cursor = connection.cursor(dictionary=(fetch is not None))
+        
+        # params or () یک ترفند پایتون برای اطمینان از ارسال تاپل خالی است اگر params=None باشد
+        cursor.execute(query, params or ())
+        
+        if fetch == 'one':
+            result = cursor.fetchone()
+        elif fetch == 'all':
+            result = cursor.fetchall()
+        else:
+            # این برای INSERT, UPDATE, DELETE است
+            connection.commit() 
+            result = True
+            
+        return result
     
-    -- ستون‌های مربوط به سفارش خرید
-    buy_client_order_id VARCHAR(100),
-    buy_quantity_raw DECIMAL(30, 20),
-    buy_quantity_formatted DECIMAL(30, 20),
-    buy_executed_quantity DECIMAL(30, 20),
-    buy_fee DECIMAL(20, 10),
+    except mysql.connector.Error as e:
+        logging.error(f"خطای کوئری پایگاه داده: {e} | کوئری: {query} | پارامترها: {params}")
+        # در صورت خطا در تراکنش، تغییرات را بازگردانی (rollback) می‌کنیم
+        if fetch is None:
+             try:
+                 connection.rollback()
+                 logging.warning("تراکنش دیتابیس به دلیل خطا Rollback شد.")
+             except Exception as rb_e:
+                 logging.error(f"خطا در زمان Rollback کردن: {rb_e}")
+        return None
     
-    -- ستون‌های مربوط به سفارش فروش
-    sell_client_order_id VARCHAR(100),
-    sell_executed_quantity DECIMAL(30, 20),
-    sell_fee DECIMAL(20, 10),
-    
-    -- === اتصال کلیدی جدید ===
-    FOREIGN KEY (account_id) REFERENCES api_accounts(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    finally:
+        # --- ۲. بازگرداندن کانکشن به استخر ---
+        # این بخش بسیار حیاتی است
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            # در pooling، connection.close() کانکشن را نمی‌بندد
+            # بلکه آن را به استخر "پس" می‌دهد تا برای کوئری بعدی آماده باشد.
+            connection.close()
